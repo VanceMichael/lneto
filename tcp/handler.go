@@ -47,6 +47,14 @@ type Handler struct {
 	// nRetransmit stores the number of times the oldest packet was retransmit.
 	nRetransmit    uint8
 	requeueControl bool
+
+	// IPv4 Path-MTU state (RFC 1191). pmtu4 zero means the default budget
+	// (peer MSS and link MTU) applies; pmtu4Link records that default from
+	// egress frame capacity and pmtu4Expire the explicit-clock deadline after
+	// which a reduced budget is dropped. See [Handler.HandlePMTU4].
+	pmtu4       uint16
+	pmtu4Link   uint16
+	pmtu4Expire int64
 }
 
 // SetLoggers sets the [slog.Logger] for the Handler and internal [ControlBlock].
@@ -388,6 +396,7 @@ func (h *Handler) Send(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	h.learnDefaultPMTU4(len(b))
 	offset := uint8(5)
 	txLimit := TransmitUnlimited
 	if h.policyEnabled() {
@@ -467,6 +476,11 @@ func (h *Handler) Send(b []byte) (int, error) {
 		if txLimit < Size(maxPayload) && !h.nextSegmentIsRetransmit() {
 			// Policy clamped new data.
 			maxPayload = int(txLimit)
+		}
+		if budget := h.pmtu4PayloadBudget(optHead); budget >= 0 && budget < maxPayload {
+			// Learned IPv4 path MTU (RFC 1191): applies to new segments and to
+			// retransmitted ones alike, independent of the peer-advertised MSS.
+			maxPayload = budget
 		}
 		segment, ok = h.scb.PendingSegment(maxPayload)
 		segment.WND = h.recvWindow()

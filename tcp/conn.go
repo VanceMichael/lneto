@@ -483,6 +483,9 @@ func (conn *Conn) Encapsulate(carrierData []byte, offsetToIP, offsetToFrame int)
 	} else if len(raddr) != len(conn.remoteAddr) {
 		return 0, lneto.ErrMismatchLen
 	}
+	// Age a learned IPv4 path-MTU budget on the explicit wall clock before
+	// building the next segment.
+	conn.h.PMTU4Tick(time.Now().UnixNano())
 	n, err = conn.h.Send(carrierData[offsetToFrame:])
 	if err != nil || n == 0 {
 		return 0, err

@@ -26,6 +26,28 @@ type node struct {
 	lport      uint16 // StackNode.LocalPort()
 }
 
+// PMTU4Func is the optional IPv4 Path-MTU notification a registered node may
+// expose. The tuple identifies the connection the validated ICMP Fragmentation
+// Needed message quoted (RFC 1191); nextHopMTU is zero for pre-RFC1191 routers.
+// nowUnixNano is the explicit clock the receiver ages path state with. It
+// reports true when a live connection consumed the notification.
+type PMTU4Func func(localAddr, remoteAddr [4]byte, localPort, remotePort uint16, nextHopMTU uint16, nowUnixNano int64) bool
+
+// pmtu4Notifier is the optional interface nodes implement to receive IPv4 PMTU
+// feedback. See [PMTU4Func].
+type pmtu4Notifier interface {
+	HandlePMTU4(localAddr, remoteAddr [4]byte, localPort, remotePort uint16, nextHopMTU uint16, nowUnixNano int64) bool
+}
+
+// handlePMTU4 forwards a validated PMTU event to the underlying node when it
+// implements [pmtu4Notifier].
+func (n *node) handlePMTU4(localAddr, remoteAddr [4]byte, localPort, remotePort uint16, nextHopMTU uint16, nowUnixNano int64) bool {
+	if n.IsInvalid() {
+		return false
+	}
+	return n.callbacks.handlePMTU4(localAddr, remoteAddr, localPort, remotePort, nextHopMTU, nowUnixNano)
+}
+
 type handlers struct {
 	nodes []node
 	// encapsIdx stores the index of next node to check for encapsulation.

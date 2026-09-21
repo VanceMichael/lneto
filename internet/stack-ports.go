@@ -96,6 +96,18 @@ func (ps *StackPorts) Register(h lneto.StackNode) error {
 	return ps.handlers.registerByPortProto(nodeFromStackNode(h, port, proto, nil))
 }
 
+// HandlePMTU4 forwards a validated IPv4 PMTU notification to the node
+// registered at localPort, if that node implements PMTU feedback. It reports
+// whether a live node consumed the event. The tuple is matched against current
+// connection state by the node itself.
+func (ps *StackPorts) HandlePMTU4(localAddr, remoteAddr [4]byte, localPort, remotePort uint16, nextHopMTU uint16, nowUnixNano int64) bool {
+	node := ps.handlers.nodeByPort(localPort)
+	if node == nil {
+		return false
+	}
+	return node.handlePMTU4(localAddr, remoteAddr, localPort, remotePort, nextHopMTU, nowUnixNano)
+}
+
 // StackPortsMACFiltered is a StackPorts implementation but that avoids calling encapsulate on nodes
 // with a non-nil MAC address registered via Register method that is set to all zero values.
 // If the address is set to nil no filtering occurs. MAC Address is set automatically on the ethernet frame by StackPortsMACFiltered when non-nil.
@@ -141,6 +153,12 @@ func (ps *StackPortsMACFiltered) ConnectionID() *uint64 { return &ps.sp.connID }
 func (ps *StackPortsMACFiltered) Demux(b []byte, offset int) (err error) {
 	// No MAC Filtering on ingress. TODO?
 	return ps.sp.Demux(b, offset)
+}
+
+// HandlePMTU4 forwards to the underlying port multiplexer. See
+// [StackPorts.HandlePMTU4].
+func (ps *StackPortsMACFiltered) HandlePMTU4(localAddr, remoteAddr [4]byte, localPort, remotePort uint16, nextHopMTU uint16, nowUnixNano int64) bool {
+	return ps.sp.HandlePMTU4(localAddr, remoteAddr, localPort, remotePort, nextHopMTU, nowUnixNano)
 }
 
 func (ps *StackPortsMACFiltered) Encapsulate(carrierData []byte, offsetToIP, offsetToFrame int) (n int, err error) {

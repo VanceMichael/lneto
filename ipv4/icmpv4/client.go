@@ -5,6 +5,7 @@ import (
 
 	"github.com/soypat/lneto"
 	"github.com/soypat/lneto/internal"
+	"github.com/soypat/lneto/ipv4"
 )
 
 var _ lneto.StackNode = (*Client)(nil) // Compile-time guarantee of interface implementation.
@@ -38,6 +39,13 @@ type Client struct {
 		raddr  [4]byte
 	}
 	responseRing internal.Ring
+	// echoEnabled gates Echo request/reply processing. It is independent of
+	// node registration so PMTU feedback keeps flowing while Echo is disabled.
+	echoEnabled bool
+	// fragNeeded4Sink receives validated ICMPv4 Fragmentation Needed events.
+	// It works independently of the echo queue configuration so TCP PMTU
+	// feedback is delivered even when ICMP Echo is disabled.
+	fragNeeded4Sink FragNeeded4Sink
 	// addrScratch holds the remote address for SetIPAddrs during Encapsulate.
 	// Kept on the (heap-resident) Client to avoid a per-call escape of a local
 	// [4]byte, which TinyGo would otherwise heap-allocate on every poll.
@@ -62,6 +70,7 @@ func (client *Client) Configure(cfg ClientConfig) error {
 	client.responseRing = internal.Ring{Buf: cfg.ResponseQueueBuffer}
 	client.magic = cfg.HashSeed
 	client.id = cfg.ID
+	client.echoEnabled = true
 	return nil
 }
 
@@ -80,10 +89,27 @@ func (client *Client) Reset() {
 	client.incomingEcho = client.incomingEcho[:0]
 	client.outgoingEcho = client.outgoingEcho[:0]
 	client.responseRing.Reset()
+	client.echoEnabled = false
+}
+
+// SetEchoEnabled toggles Echo request/reply handling without affecting the
+// registered node or PMTU feedback delivery.
+func (client *Client) SetEchoEnabled(enabled bool) {
+	client.echoEnabled = enabled
 }
 
 func (client *Client) IncomingEchoCapacity() int {
 	return cap(client.incomingEcho)
+}
+
+// SetFragNeeded4Sink installs the handler that receives validated ICMPv4
+// Destination Unreachable/Fragmentation Needed messages (RFC 1191 PMTU
+// feedback). The sink only sees messages that pass checksum and quote
+// validation; it must match the contained tuple against live connections
+// itself. A nil sink disables delivery. The sink is preserved by
+// [Client.Reset]/[Client.Abort].
+func (client *Client) SetFragNeeded4Sink(sink FragNeeded4Sink) {
+	client.fragNeeded4Sink = sink
 }
 
 func (client *Client) Demux(carrierData []byte, frameOffset int) error {
@@ -93,7 +119,15 @@ func (client *Client) Demux(carrierData []byte, frameOffset int) error {
 		return err
 	}
 	tp := ifrm.Type()
+	if tp == TypeDestinationUnreachable {
+		return client.demuxDestUnreachable(carrierData, frameOffset, rawdata)
+	}
 	if tp != TypeEcho && tp != TypeEchoReply {
+		return lneto.ErrPacketDrop
+	}
+	if !client.echoEnabled {
+		// Echo support disabled (default until explicitly enabled); PMTU
+		// feedback is handled above, all other ICMP traffic is dropped.
 		return lneto.ErrPacketDrop
 	}
 	var crc lneto.CRC791
@@ -149,6 +183,40 @@ func (client *Client) Demux(carrierData []byte, frameOffset int) error {
 		err = lneto.ErrPacketDrop
 	}
 	return err
+}
+
+// demuxDestUnreachable handles ICMP type 3 messages. Only Fragmentation Needed
+// (code 4) quotes are parsed; everything else is dropped like any unknown ICMP
+// message. Validated PMTU events are delivered to the configured sink and never
+// surface as receive errors. Feedback that arrives in a broadcast/multicast
+// outer context is invalid (RFC 1122) and is ignored.
+func (client *Client) demuxDestUnreachable(carrierData []byte, frameOffset int, rawdata []byte) error {
+	if CodeDestinationUnreachable(rawdata[1]) != CodeFragNeededAndDFSet {
+		return lneto.ErrPacketDrop
+	}
+	if frameOffset >= 20 {
+		_, dst, _, _, err := internal.GetIPAddr(carrierData)
+		if err != nil {
+			return lneto.ErrPacketDrop
+		}
+		if len(dst) == 4 {
+			d := [4]byte(dst)
+			if ipv4.IsMulticast(d) || ipv4.IsBroadcast(d) {
+				return lneto.ErrPacketDrop
+			}
+		}
+	}
+	ev, ok, err := ParseFragNeeded4(rawdata)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return lneto.ErrPacketDrop
+	}
+	if client.fragNeeded4Sink != nil {
+		client.fragNeeded4Sink(ev)
+	}
+	return nil
 }
 
 func (client *Client) Encapsulate(carrierData []byte, ipOffset, frameOffset int) (int, error) {

@@ -292,7 +292,20 @@ func (s *StackAsync) Reset(cfg StackConfig) (err error) {
 		if err != nil {
 			return err
 		}
+		// Echo stays opt-in at the stack level (EnableICMP); the node itself
+		// must remain registered so PMTU feedback works without Echo enabled.
+		s.icmp.SetEchoEnabled(false)
 	}
+	// ICMP is always registered so validated Fragmentation Needed messages
+	// reach the TCP PMTU feedback loop even when Echo (ping) is disabled; the
+	// unconfigured client drops Echo traffic and only parses PMTU events.
+	// Registration must follow Configure: Configure bumps the connection ID and
+	// would otherwise invalidate the registered node.
+	err = s.ip4.Register4(&s.icmp)
+	if err != nil {
+		return err
+	}
+	s.icmp.SetFragNeeded4Sink(s.handlePMTU4)
 	var timebuf [4]int64
 	s.sysprec = ntp.CalculateSystemPrecision(nil, timebuf[:])
 	if s.clientID == "" {
@@ -453,19 +466,24 @@ func (s *StackAsync) IsIPv6Enabled() bool {
 	return enabled
 }
 
-// EnableICMP registers an ICMP handler to the stack when enabled is true.
-// If enabled=false the currently registered ICMP handler is unregistered and state reset.
+// EnableICMP enables ICMP Echo (ping) support when enabled is true and the stack
+// was reset with a non-zero ICMPQueueLimit. Disabling it clears echo state but
+// keeps the ICMP node registered so TCP Path-MTU feedback works regardless of
+// Echo being enabled.
 func (s *StackAsync) EnableICMP(enabled bool) (err error) {
-	if s.icmp.IncomingEchoCapacity() == 0 {
-		err = lneto.ErrInvalidConfig
-		enabled = false // ensure aborted.
+	if enabled && s.icmp.IncomingEchoCapacity() == 0 {
+		return lneto.ErrInvalidConfig
 	}
 	if enabled {
+		s.icmp.SetEchoEnabled(true)
 		if !s.ip4.IsRegistered4(lneto.IPProtoICMP) {
 			err = s.ip4.Register4(&s.icmp)
 		}
 	} else {
-		s.icmp.Abort()
+		// Clear echo queues but do not invalidate the node: PMTU feedback
+		// delivery must survive Echo being switched off.
+		s.icmp.Reset()
+		s.icmp.SetEchoEnabled(false)
 	}
 	if s.ipv6enabled {
 		if err2 := s.stack6.EnableICMP6(enabled); err2 != nil && err == nil {
@@ -473,6 +491,18 @@ func (s *StackAsync) EnableICMP(enabled bool) (err error) {
 		}
 	}
 	return err
+}
+
+// handlePMTU4 consumes a validated ICMPv4 Fragmentation Needed event from the
+// ICMP client. It runs under the stack lock as part of the Ingress demux
+// chain. The local address must match a configured stack address and the
+// event is delivered to the TCP connection matching the quoted tuple; the
+// connection performs the port/state checks and updates its send budget.
+func (s *StackAsync) handlePMTU4(ev icmpv4.FragNeeded4) {
+	if local := s.ip4.Addr4(); local != ([4]byte{}) && ev.LocalAddr != local {
+		return // Quote references a different local address.
+	}
+	s.tcps.HandlePMTU4(ev.LocalAddr, ev.RemoteAddr, ev.LocalPort, ev.RemotePort, ev.NextHopMTU, time.Now().UnixNano())
 }
 
 func (s *StackAsync) DialUDP(conn *udp.Conn, localPort uint16, addrp netip.AddrPort) (err error) {
