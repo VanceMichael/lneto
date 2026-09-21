@@ -168,9 +168,14 @@ func (conn *Conn) Read(b []byte) (int, error) {
 			return 0, net.ErrClosed
 		}
 		n, err := conn.h.ReadNext(b)
+		// An ICMPv4 Port Unreachable attributed to this connected flow
+		// interrupts the wait exactly once, then is cleared.
+		failed := n == 0 && conn.h.consumePortUnreachable()
 		conn.mu.Unlock()
 		if n > 0 {
 			return n, err
+		} else if failed {
+			return 0, ErrPortUnreachable
 		}
 		if conn.deadlineExceeded(&conn.rdead) {
 			return 0, os.ErrDeadlineExceeded
@@ -198,6 +203,21 @@ func (conn *Conn) Demux(carrierData []byte, frameOffset int) error {
 		return net.ErrClosed
 	}
 	return conn.h.Recv(carrierData[frameOffset:])
+}
+
+// RecvPortUnreachable implements [PortUnreachableReceiver]. It validates the
+// quoted four-tuple against the connected local/remote endpoints and arms a
+// single error for the waiting read.
+func (conn *Conn) RecvPortUnreachable(t PortUnreachable) bool {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if conn.h.closeCalled {
+		return false
+	}
+	if len(conn.remoteAddr) == 4 && t.DstIP != [4]byte(conn.remoteAddr) {
+		return false // Error references a different remote endpoint.
+	}
+	return conn.h.armPortUnreachable(t)
 }
 
 // Encapsulate writes a queued outgoing datagram into the carrier buffer.

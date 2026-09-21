@@ -24,6 +24,11 @@ type Handler struct {
 	closeCalled bool
 	lport       uint16
 	rport       uint16
+	// portUnreachable latches a single ICMPv4 Port Unreachable attributed to
+	// the connected (lport,rport) flow. It is consumed once by the waiting read
+	// and is cleared by Configure/Abort so a new connection generation starts
+	// with no pending error.
+	portUnreachable bool
 }
 
 // Configure initializes the handler with the given buffer and queue configuration.
@@ -40,6 +45,7 @@ func (h *Handler) Configure(cfg ConnConfig) error {
 	h.closeCalled = false
 	h.lport = 0
 	h.rport = 0
+	h.portUnreachable = false
 	return nil
 }
 
@@ -172,6 +178,29 @@ func (h *Handler) IsOpen() bool {
 // return [net.ErrClosed] after Close is called.
 func (h *Handler) Close() {
 	h.closeCalled = true
+}
+
+// armPortUnreachable latches an ICMPv4 Port Unreachable when the quoted
+// four-tuple's ports match this connected socket. A pending, not-yet-consumed
+// error coalesces duplicates so the failure is delivered at most once.
+// Returns true when the error belongs to (and is now pending on) this socket.
+func (h *Handler) armPortUnreachable(t PortUnreachable) bool {
+	if h.closeCalled {
+		return false
+	} else if t.SrcPort != h.lport || t.DstPort != h.rport {
+		return false
+	}
+	h.portUnreachable = true
+	return true
+}
+
+// consumePortUnreachable returns and clears the latched Port Unreachable, so
+// the failure interrupts exactly one waiting read. After it clears the socket
+// stays usable for further sends.
+func (h *Handler) consumePortUnreachable() bool {
+	v := h.portUnreachable
+	h.portUnreachable = false
+	return v
 }
 
 // Abort resets the handler, discarding all buffered data and incrementing the

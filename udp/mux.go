@@ -100,6 +100,22 @@ type muxHandler struct {
 		raddr  netip.Addr
 	}
 	closeCalled bool
+
+	// ICMPv4 Port Unreachable attribution. puRecent remembers the most recent
+	// send generations (FIFO) so an incoming error can be validated against the
+	// full four-tuple of a datagram this mux actually sent. puPending latches a
+	// single matched error for exactly-once delivery to the waiting reader.
+	puRecent  [4]puSend
+	puRecentN uint8
+	puPending bool
+}
+
+// puSend records the destination of a recently transmitted datagram used to
+// validate a quoted four-tuple in an ICMPv4 Port Unreachable response.
+type puSend struct {
+	lport uint16
+	rport uint16
+	raddr netip.Addr
 }
 
 // Configure initializes the handler with the given buffer and queue configuration.
@@ -276,7 +292,69 @@ func (mh *muxHandler) WriteTo(buf []byte, lport uint16, raddr netip.AddrPort) er
 	dgram.raddr = raddr.Addr()
 	dgram.lport = lport
 	dgram.rport = raddr.Port()
+	mh.recordPUSend(lport, raddr.Port(), raddr.Addr())
 	return nil
+}
+
+// recordPUSend remembers a send generation for later ICMP error attribution,
+// evicting the oldest record when the fixed history is full.
+func (mh *muxHandler) recordPUSend(lport, rport uint16, raddr netip.Addr) {
+	if mh.puRecentN == uint8(len(mh.puRecent)) {
+		copy(mh.puRecent[:], mh.puRecent[1:])
+		mh.puRecentN--
+	}
+	mh.puRecent[mh.puRecentN] = puSend{lport: lport, rport: rport, raddr: raddr}
+	mh.puRecentN++
+}
+
+// RecvPortUnreachable implements [PortUnreachableReceiver]. The quoted
+// four-tuple must match a datagram this mux actually sent (local port filter
+// plus recorded remote endpoint). The matched send generation is consumed and a
+// single error is armed for the waiting reader; duplicates coalesce.
+func (mh *muxHandler) RecvPortUnreachable(t PortUnreachable) bool {
+	if mh.closeCalled {
+		return false
+	}
+	// Only a local port this mux owns can receive the error.
+	if mh.FilterLocalPort(t.SrcPort) {
+		return false
+	}
+	if mh.puPending {
+		// An unmatched-while-pending error cannot be delivered a second time;
+		// claim it so the ICMP is not attributed to another socket.
+		return true
+	}
+	dstAddr, ok := netip.AddrFromSlice(t.DstIP[:])
+	if !ok || !dstAddr.Is4() {
+		return false
+	}
+	idx := -1
+	for i := uint8(0); i < mh.puRecentN; i++ {
+		e := &mh.puRecent[i]
+		if e.lport == t.SrcPort && e.rport == t.DstPort && e.raddr == dstAddr {
+			idx = int(i)
+			break
+		}
+	}
+	if idx < 0 {
+		return false // No matching send generation: not ours.
+	}
+	// Retire the failed send generation so it cannot attribute twice.
+	last := int(mh.puRecentN)
+	copy(mh.puRecent[idx:], mh.puRecent[idx+1:last])
+	mh.puRecentN--
+	mh.puRecent[mh.puRecentN] = puSend{}
+	mh.puPending = true
+	return true
+}
+
+// consumePortUnreachable returns and clears the latched Port Unreachable,
+// delivering the failure to exactly one waiting read and leaving the mux ready
+// to send and receive on the same local port(s).
+func (mh *muxHandler) consumePortUnreachable() bool {
+	v := mh.puPending
+	mh.puPending = false
+	return v
 }
 
 // ReadNext dequeues the next received datagram into b. If b is smaller than the

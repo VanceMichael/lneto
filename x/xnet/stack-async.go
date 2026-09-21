@@ -293,6 +293,10 @@ func (s *StackAsync) Reset(cfg StackConfig) (err error) {
 			return err
 		}
 	}
+	// Route inbound ICMPv4 Port Unreachable quotes to the UDP socket that sent
+	// the original datagram. Safe to set unconditionally: the client only
+	// receives frames while registered via EnableICMP.
+	s.icmp.SetPortUnreachableHandler(s.deliverUDPPortUnreachable4)
 	var timebuf [4]int64
 	s.sysprec = ntp.CalculateSystemPrecision(nil, timebuf[:])
 	if s.clientID == "" {
@@ -473,6 +477,22 @@ func (s *StackAsync) EnableICMP(enabled bool) (err error) {
 		}
 	}
 	return err
+}
+
+// deliverUDPPortUnreachable4 routes an ICMPv4 Port Unreachable quote, received
+// on the ingress path while the stack lock is held, to the UDP socket bound to
+// the quoted original source port. The quoted source must be this stack's own
+// address; the socket performs the full four-tuple validation.
+func (s *StackAsync) deliverUDPPortUnreachable4(q icmpv4.PortUnreachableQuote) bool {
+	if q.SrcIP != s.ip4.Addr4() {
+		return false
+	}
+	return s.udps.DeliverUDPPortUnreachable(udp.PortUnreachable{
+		SrcIP:   q.SrcIP,
+		DstIP:   q.DstIP,
+		SrcPort: q.SrcPort,
+		DstPort: q.DstPort,
+	})
 }
 
 func (s *StackAsync) DialUDP(conn *udp.Conn, localPort uint16, addrp netip.AddrPort) (err error) {

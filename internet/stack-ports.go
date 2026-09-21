@@ -2,6 +2,7 @@ package internet
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"math"
@@ -11,7 +12,14 @@ import (
 	"github.com/soypat/lneto/ethernet"
 	"github.com/soypat/lneto/internal"
 	"github.com/soypat/lneto/tcp"
+	"github.com/soypat/lneto/udp"
 )
+
+// errUDPNoListener is an internal signal returned by [StackPorts.Demux] when a
+// UDP datagram found no registered port node. It is never delivered to callers;
+// the IPv4 layer translates it into an ICMPv4 Port Unreachable and reports
+// [lneto.ErrPacketDrop].
+var errUDPNoListener = errors.New("udp: no listener for destination port")
 
 type StackPorts struct {
 	connID     uint64
@@ -67,6 +75,13 @@ func (ps *StackPorts) Demux(b []byte, offset int) (err error) {
 	}
 	port := binary.BigEndian.Uint16(b[int(ps.dstPortOff)+offset:])
 	_, err = ps.handlers.demuxByPort(b, offset, port)
+	if err == lneto.ErrPacketDrop && ps.protocol == uint16(lneto.IPProtoUDP) {
+		// No UDP node is bound to the destination port. Signal the IPv4 layer
+		// to answer (for local unicast destinations) with ICMPv4 Port
+		// Unreachable. An existing binding that rejects the packet returns
+		// other errors and never reaches this branch.
+		return errUDPNoListener
+	}
 	if err == lneto.ErrPacketDrop && ps.protocol == uint16(lneto.IPProtoTCP) && offset+14 <= len(b) {
 		// RFC 9293 §3.10.7.1: RST for SYN to port with no listener.
 		flags := binary.BigEndian.Uint16(b[offset+12:]) & 0x01ff
@@ -94,6 +109,21 @@ func (ps *StackPorts) Register(h lneto.StackNode) error {
 		return lneto.ErrInvalidConfig
 	}
 	return ps.handlers.registerByPortProto(nodeFromStackNode(h, port, proto, nil))
+}
+
+// DeliverUDPPortUnreachable routes a received ICMPv4 Port Unreachable, whose
+// quoted original source port is the local UDP port, to the bound socket. The
+// socket itself validates the quoted four-tuple and decides whether the error
+// belongs to it. Returns true when a UDP socket accepted the error.
+func (ps *StackPorts) DeliverUDPPortUnreachable(t udp.PortUnreachable) bool {
+	if ps.protocol != uint16(lneto.IPProtoUDP) {
+		return false
+	}
+	node := ps.handlers.nodeByPort(t.SrcPort)
+	if node == nil {
+		return false
+	}
+	return node.callbacks.RecvPortUnreachable(t)
 }
 
 // StackPortsMACFiltered is a StackPorts implementation but that avoids calling encapsulate on nodes
@@ -141,6 +171,12 @@ func (ps *StackPortsMACFiltered) ConnectionID() *uint64 { return &ps.sp.connID }
 func (ps *StackPortsMACFiltered) Demux(b []byte, offset int) (err error) {
 	// No MAC Filtering on ingress. TODO?
 	return ps.sp.Demux(b, offset)
+}
+
+// DeliverUDPPortUnreachable delegates ICMPv4 Port Unreachable delivery to the
+// underlying UDP port handlers.
+func (ps *StackPortsMACFiltered) DeliverUDPPortUnreachable(t udp.PortUnreachable) bool {
+	return ps.sp.DeliverUDPPortUnreachable(t)
 }
 
 func (ps *StackPortsMACFiltered) Encapsulate(carrierData []byte, offsetToIP, offsetToFrame int) (n int, err error) {

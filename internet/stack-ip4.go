@@ -8,6 +8,7 @@ import (
 	"github.com/soypat/lneto/ethernet"
 	"github.com/soypat/lneto/internal"
 	"github.com/soypat/lneto/ipv4"
+	"github.com/soypat/lneto/ipv4/icmpv4"
 	"github.com/soypat/lneto/tcp"
 	"github.com/soypat/lneto/udp"
 )
@@ -60,6 +61,9 @@ type stackip4 struct {
 	ip4             [4]byte
 	acceptMulticast bool
 	acceptBroadcast bool
+	// icmpUnreach holds stateless ICMPv4 Port Unreachable responses generated
+	// for UDP datagrams sent to a local unicast address with no bound UDP node.
+	icmpUnreach icmpv4.PortUnreachableQueue
 }
 
 func (si4 *stackip4) reset4(vld *lneto.Validator, maxNodes int) {
@@ -168,11 +172,39 @@ func (si4 *stackip4) demux4(carrierData []byte, offset int) error {
 	totalLen := ifrm.TotalLength()
 	si4.handlers.info("ipDemux", slog.String("ipproto", proto.String()), slog.Int("tlen", int(totalLen)))
 	err = node.callbacks.Demux(frame[:totalLen], off)
+	if err == errUDPNoListener {
+		si4.queueUDPPortUnreachable(ifrm, int(totalLen), off)
+		err = lneto.ErrPacketDrop
+	}
 	if si4.handlers.tryHandleError(node, err) {
 		si4.handlers.info("ipclose", slog.String("proto", proto.String()))
 		err = nil
 	}
 	return err
+}
+
+// queueUDPPortUnreachable enqueues an RFC 792 ICMPv4 Destination Unreachable /
+// Port Unreachable for a UDP datagram that matched no bound UDP node. The
+// quote carries the original IPv4 header and the original UDP header. The
+// response is generated exclusively for unicast datagrams addressed to this
+// stack's configured address: broadcast, multicast, unconfigured (accept-all)
+// and truncated datagrams never produce an error. Incoming IPv4/UDP checksums
+// have already been validated by the caller.
+func (si4 *stackip4) queueUDPPortUnreachable(ifrm ipv4.Frame, totalLen, ipHeaderLen int) {
+	dst := *ifrm.DestinationAddr()
+	if si4.ip4 == ([4]byte{}) || dst != si4.ip4 {
+		return // Not addressed to a configured local unicast address.
+	}
+	if ipv4.IsMulticast(dst) || ipv4.IsBroadcast(dst) {
+		return
+	}
+	const udpHeaderLen = 8
+	quoteLen := ipHeaderLen + udpHeaderLen
+	if totalLen < quoteLen || len(ifrm.RawData()) < quoteLen {
+		return // Truncated reference: never quote an undeliverable fragment.
+	}
+	quote := ifrm.RawData()[:quoteLen]
+	si4.icmpUnreach.Queue(ifrm.SourceAddr()[:], quote)
 }
 
 func (si4 *stackip4) encapsulate4(carrierData []byte, offsetToIP int) (int, error) {
@@ -196,10 +228,18 @@ func (si4 *stackip4) encapsulate4(carrierData []byte, offsetToIP int) (int, erro
 	// Children (TCP/UDP) start at offset headerlen (20 bytes after IP header start).
 	// offsetToIP is 0 relative to this slice (frame), children's frame starts at headerlen.
 	node, n, err := si4.handlers.encapsulateAny(carrierData, offsetToIP, offsetToIP+headerlen)
-	if n == 0 {
-		return n, err
+	var proto lneto.IPProto
+	if n > 0 {
+		proto = lneto.IPProto(node.proto)
+	} else {
+		// No pending traffic on registered protocols: emit a queued stateless
+		// ICMPv4 error (e.g. Port Unreachable for an unbound local UDP port).
+		n, err = si4.icmpUnreach.Drain(carrierData, offsetToIP, offsetToIP+headerlen)
+		if n == 0 {
+			return 0, err
+		}
+		proto = lneto.IPProtoICMP
 	}
-	proto := lneto.IPProto(node.proto)
 	totalLen := n + headerlen
 	ifrm.SetTotalLength(uint16(totalLen))
 	ifrm.SetProtocol(proto)

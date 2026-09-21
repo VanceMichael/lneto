@@ -137,6 +137,15 @@ func (pc *PacketConn) Demux(carrierData []byte, frameOffset int) error {
 	return pc.m.Demux(carrierData, frameOffset)
 }
 
+// RecvPortUnreachable implements [PortUnreachableReceiver]. It validates the
+// quoted four-tuple against a datagram previously sent with WriteTo and arms a
+// single error for the waiting ReadFrom.
+func (pc *PacketConn) RecvPortUnreachable(t PortUnreachable) bool {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	return pc.m.RecvPortUnreachable(t)
+}
+
 // Encapsulate implements [lneto.StackNode].
 func (pc *PacketConn) Encapsulate(carrierData []byte, offsetToIP, offsetToFrame int) (int, error) {
 	pc.mu.Lock()
@@ -159,9 +168,12 @@ func (pc *PacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error)
 			return 0, netip.AddrPort{}, net.ErrClosed
 		}
 		n, _, _, addr = pc.m.ReadNext(p)
+		failed := n == 0 && pc.m.consumePortUnreachable()
 		pc.mu.Unlock()
 		if n > 0 {
 			return n, addr, nil
+		} else if failed {
+			return 0, netip.AddrPort{}, ErrPortUnreachable
 		}
 		if pc.deadlineExceeded(&pc.rdead) {
 			return 0, netip.AddrPort{}, os.ErrDeadlineExceeded

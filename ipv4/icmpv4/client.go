@@ -1,6 +1,7 @@
 package icmpv4
 
 import (
+	"encoding/binary"
 	"slices"
 
 	"github.com/soypat/lneto"
@@ -42,6 +43,21 @@ type Client struct {
 	// Kept on the (heap-resident) Client to avoid a per-call escape of a local
 	// [4]byte, which TinyGo would otherwise heap-allocate on every poll.
 	addrScratch [4]byte
+
+	// onPortUnreachable, when set, receives the four-tuple quoted by an inbound
+	// ICMPv4 Destination Unreachable / Port Unreachable. It returns true when a
+	// local UDP socket claimed the error. The callback runs on the ingress path
+	// and must not re-enter the Client.
+	onPortUnreachable func(PortUnreachableQuote) bool
+}
+
+// PortUnreachableQuote describes the original UDP datagram quoted inside an
+// ICMPv4 Destination Unreachable / Port Unreachable message (RFC 792).
+type PortUnreachableQuote struct {
+	// SrcIP and DstIP are the quoted original source/destination IPv4 addresses.
+	SrcIP, DstIP [4]byte
+	// SrcPort and DstPort are the quoted original UDP source/destination ports.
+	SrcPort, DstPort uint16
 }
 
 type ClientConfig struct {
@@ -66,6 +82,13 @@ func (client *Client) Configure(cfg ClientConfig) error {
 }
 
 func (client *Client) Protocol() uint64 { return uint64(lneto.IPProtoICMP) }
+
+// SetPortUnreachableHandler installs the handler for inbound ICMPv4
+// Destination Unreachable / Port Unreachable messages that quote UDP.
+// Passing nil removes the handler.
+func (client *Client) SetPortUnreachableHandler(handler func(PortUnreachableQuote) bool) {
+	client.onPortUnreachable = handler
+}
 
 func (client *Client) LocalPort() uint16 { return 0 }
 
@@ -93,12 +116,15 @@ func (client *Client) Demux(carrierData []byte, frameOffset int) error {
 		return err
 	}
 	tp := ifrm.Type()
-	if tp != TypeEcho && tp != TypeEchoReply {
-		return lneto.ErrPacketDrop
-	}
 	var crc lneto.CRC791
 	if crc.PayloadSum16(rawdata) != 0 {
 		return lneto.ErrBadCRC
+	}
+	if tp == TypeDestinationUnreachable {
+		return client.demuxDestUnreachable(rawdata)
+	}
+	if tp != TypeEcho && tp != TypeEchoReply {
+		return lneto.ErrPacketDrop
 	}
 	var raddr [4]byte
 	ipEnabled := frameOffset >= 20
@@ -149,6 +175,44 @@ func (client *Client) Demux(carrierData []byte, frameOffset int) error {
 		err = lneto.ErrPacketDrop
 	}
 	return err
+}
+
+// demuxDestUnreachable parses an ICMPv4 Destination Unreachable message. Only
+// Port Unreachable (code 4) quoting a UDP datagram is acted on. The embedded
+// reference must contain a complete, self-consistent IPv4 header followed by
+// the UDP header; truncated references are dropped instead of being
+// attributed to a socket. The quoted four-tuple is handed to the registered
+// handler, which is responsible for matching it to a local socket.
+func (client *Client) demuxDestUnreachable(rawdata []byte) error {
+	if rawdata[1] != uint8(CodePortUnreachable) {
+		return lneto.ErrPacketDrop
+	}
+	quote := rawdata[sizeHeader:] // 8-byte ICMP header precedes the quote.
+	if len(quote) < ipv4MinHeader+sizeHeader {
+		return lneto.ErrPacketDrop // Truncated quote: no full IPv4+UDP headers.
+	}
+	if quote[0]>>4 != 4 {
+		return lneto.ErrPacketDrop
+	}
+	ihl := int(quote[0]&0x0f) * 4
+	if ihl < ipv4MinHeader || ihl > maxIPv4Header || len(quote) < ihl+sizeHeader {
+		return lneto.ErrPacketDrop
+	}
+	if lneto.IPProto(quote[9]) != lneto.IPProtoUDP {
+		return lneto.ErrPacketDrop
+	}
+	if total := binary.BigEndian.Uint16(quote[2:4]); int(total) < ihl+sizeHeader {
+		return lneto.ErrPacketDrop // Quoted IP length cannot cover the UDP header.
+	}
+	var q PortUnreachableQuote
+	copy(q.SrcIP[:], quote[12:16])
+	copy(q.DstIP[:], quote[16:20])
+	q.SrcPort = binary.BigEndian.Uint16(quote[ihl : ihl+2])
+	q.DstPort = binary.BigEndian.Uint16(quote[ihl+2 : ihl+4])
+	if client.onPortUnreachable == nil || !client.onPortUnreachable(q) {
+		return lneto.ErrPacketDrop
+	}
+	return nil
 }
 
 func (client *Client) Encapsulate(carrierData []byte, ipOffset, frameOffset int) (int, error) {
