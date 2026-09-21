@@ -49,7 +49,7 @@ func TestConn_PortUnreachable_DeliveredOnce(t *testing.T) {
 
 	// Exactly once: the next read blocks until its deadline.
 	conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
-	if _, err := conn.Read(buf[:]); !errors.Is(err, osDeadline()) {
+	if _, err := conn.Read(buf[:]); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("second Read error = %v, want deadline exceeded", err)
 	}
 }
@@ -74,7 +74,7 @@ func TestConn_PortUnreachable_ReconfigureClearsGeneration(t *testing.T) {
 	}
 	conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
 	var buf [64]byte
-	if _, err := conn.Read(buf[:]); !errors.Is(err, osDeadline()) {
+	if _, err := conn.Read(buf[:]); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("Read after reconfigure = %v, want deadline (stale error cleared)", err)
 	}
 	// Sending on the same port still works.
@@ -149,7 +149,7 @@ func TestPacketConn_PortUnreachable_MatchSendGeneration(t *testing.T) {
 
 	// Once: subsequent read hits the deadline; further sends on same port work.
 	pc.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
-	if _, _, err := pc.ReadFrom(buf[:]); !errors.Is(err, osDeadline()) {
+	if _, _, err := pc.ReadFrom(buf[:]); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("second ReadFrom = %v, want deadline", err)
 	}
 	if _, err := pc.WriteTo([]byte("again"), dst); err != nil {
