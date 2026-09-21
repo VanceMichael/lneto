@@ -47,11 +47,18 @@ type StackAsync struct {
 	dhcpResults DHCPResults
 	arpt        subnetTable
 
-	dnsUDP  internet.StackUDPPort
-	dns     dns.Client
-	ednsopt dns.Resource
-	lookup  dns.Message
-	dnssv   netip.Addr
+	dnsUDP   internet.StackUDPPort
+	dns      dns.Client
+	dnsqnode dnsQueryNode
+	// dnsInflight records the single armed hardware DNS query when snapshot
+	// caching is enabled; nil when the dns.Client is idle.
+	dnsInflight *dnsInflightQuery
+	// dnscache is the optional bounded resolution snapshot cache. Nil keeps
+	// the legacy one-query-per-call lookup behavior.
+	dnscache *dns.SnapshotCache
+	ednsopt  dns.Resource
+	lookup   dns.Message
+	dnssv    netip.Addr
 
 	// ephPort drives sequential ephemeral-port allocation (see
 	// [StackAsync.ephemeralPort]); zero means not yet seeded.
@@ -86,7 +93,13 @@ type StackConfig struct {
 
 	DNSServer netip.Addr
 	NTPServer netip.Addr
-	RandSeed  int64
+	// DNSCache enables bounded, TTL-based DNS resolution snapshots with
+	// in-flight coalescing for the StackBlocking/StackRetrying lookup chain.
+	// Nil preserves the one-query-per-call behavior; direct StartLookupIPType
+	// calls are never cached. Changing DNSServer, the stack's IPv4 address or
+	// reconfiguring the stack invalidates all snapshots.
+	DNSCache *dns.SnapshotConfig
+	RandSeed int64
 	// Hostname is used for DHCP hostname and ICMP ID.
 	Hostname string
 
@@ -299,6 +312,19 @@ func (s *StackAsync) Reset(cfg StackConfig) (err error) {
 		s.clientID = "lneto-" + s.hostname
 	}
 	s.stats = Statistics{}
+	// (Re)configure DNS resolution snapshots. A Reset is a configuration
+	// change, so any previous generation and snapshot is discarded.
+	s.dnsqnode.Client = &s.dns
+	s.dnsInflight = nil
+	if cfg.DNSCache != nil {
+		cache, cerr := dns.NewSnapshotCache(*cfg.DNSCache)
+		if cerr != nil {
+			return cerr
+		}
+		s.dnscache = cache
+	} else {
+		s.dnscache = nil
+	}
 	if cfg.DNSServer.IsValid() {
 		s.dnssv = cfg.DNSServer
 	}
@@ -387,8 +413,16 @@ func (s *StackAsync) SetAddr4(addr [4]byte) error {
 }
 
 func (s *StackAsync) setIPAddr4(addr [4]byte) error {
+	addrChanged := s.ip4.Addr4() != addr
 	s.ip4.SetAddr4(addr)
-	return s.arp.UpdateProtoAddr(addr[:])
+	err := s.arp.UpdateProtoAddr(addr[:])
+	// The local source address is part of a query's identity: snapshots and
+	// in-flight generations learned from the old address must not survive it,
+	// even if the ARP update itself reported an error.
+	if addrChanged {
+		s.invalidateDNSSnapshotsLocked()
+	}
+	return err
 }
 
 func (s *StackAsync) Addr4() [4]byte {
@@ -621,6 +655,10 @@ func (s *StackAsync) StartLookupIP(host string) error {
 // StartLookupIPType begins resolving host for the given record type (e.g. dns.TypeA
 // or dns.TypeAAAA). The DNS query is always carried over IPv4 to the configured DNS
 // server; resolving over an IPv6 DNS transport is not yet supported.
+//
+// This is the direct, uncached entry point and is unaffected by
+// StackConfig.DNSCache; snapshot caching only applies to the StackBlocking and
+// StackRetrying lookup call chain.
 func (s *StackAsync) StartLookupIPType(host string, qtype dns.Type) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -634,12 +672,19 @@ func (s *StackAsync) StartLookupIPType(host string, qtype dns.Type) error {
 	if err != nil {
 		return err
 	}
+	return s.armDNSQueryLocked(name, qtype)
+}
 
+// armDNSQueryLocked arms the shared dns.Client and registers its UDP node for
+// a fresh query. It performs the ordinary demux-bound query path and is used
+// both by the direct StartLookupIPType API and by cache-mediated lookups.
+// The caller must hold s.mu.
+func (s *StackAsync) armDNSQueryLocked(name dns.Name, qtype dns.Type) error {
 	// EDNS0 buffer size: MTU minus overhead for IP+UDP headers and safety margin.
 	// 100 bytes covers IPv4 max header (60) + UDP (8) + 32 byte margin.
 	s.ednsopt.SetEDNS0(uint16(s.link.MTU())-100, 0, 0, nil)
 	rand := s.prand32()
-	err = s.dns.StartResolve(uint16(rand>>1)+1024, uint16(rand), dns.ResolveConfig{
+	err := s.dns.StartResolve(uint16(rand>>1)+1024, uint16(rand), dns.ResolveConfig{
 		Questions: []dns.Question{
 			{
 				Name:  name,
@@ -654,14 +699,19 @@ func (s *StackAsync) StartLookupIPType(host string, qtype dns.Type) error {
 		// Leave headroom above the address buffer for CNAME records, which
 		// occupy answer slots before the addresses they alias.
 		MaxResponseAnswers: uint16(len(s.addrbufnip)) + 8,
+		// Decode one authority record so a negative response's SOA MINIMUM
+		// can drive the RFC 2308 negative-caching TTL.
+		MaxAuthorityRecords: 1,
 	})
 	if err != nil {
 		return err
 	}
 	*(*[4]byte)(s.addrBuf[:4]) = s.dnssv.As4()
-	s.dnsUDP.SetStackNode(&s.dns, s.addrBuf[:4], dns.ServerPort)
-	err = s.udps.RegisterMACFiltered(&s.dnsUDP, nil)
-	return err
+	// Clear any validation error left by a previous generation and register
+	// the observing wrapper node instead of the bare dns.Client.
+	s.dnsqnode.demuxErr = nil
+	s.dnsUDP.SetStackNode(&s.dnsqnode, s.addrBuf[:4], dns.ServerPort)
+	return s.udps.RegisterMACFiltered(&s.dnsUDP, nil)
 }
 
 var (
@@ -830,7 +880,12 @@ func (stack *StackAsync) AssimilateDHCPResults(results *DHCPResults) error {
 		if !results.DNSServers[0].IsValid() || !results.DNSServers[0].Is4() {
 			return lneto.ErrInvalidAddr
 		}
-		stack.dnssv = results.DNSServers[0]
+		if stack.dnssv != results.DNSServers[0] {
+			stack.dnssv = results.DNSServers[0]
+			// A different server answers a different key: old snapshots and
+			// any in-flight query to the old server must not remain hits.
+			stack.invalidateDNSSnapshotsLocked()
+		}
 	}
 	return nil
 }

@@ -157,7 +157,45 @@ func (s StackBlocking) DoLookupIP(host string, timeout time.Duration) (addrs []n
 
 // DoLookupIPType resolves host for the given record type (dns.TypeA or dns.TypeAAAA),
 // blocking until a response arrives or the timeout elapses.
+//
+// When the stack was configured with StackConfig.DNSCache, a still-valid
+// snapshot is returned without sending a UDP query, concurrent callers for the
+// same host/type/server share the in-flight generation, and a miss goes
+// through the ordinary StartLookupIPType/demux/result path exactly once.
 func (s StackBlocking) DoLookupIPType(host string, timeout time.Duration, qtype dns.Type) (addrs []netip.Addr, err error) {
+	if s.async.dnscache == nil {
+		return s.doLookupIPTypeUncached(host, timeout, qtype)
+	}
+	var st dnsLookupState
+	var gen uint64
+	st, gen, addrs, err = s.async.dnsLookupBegin(host, qtype)
+	if err != nil {
+		return nil, err
+	}
+	// A snapshot hit needs no UDP query and no deadline wait.
+	if st == dnsLookupHit {
+		return addrs, err
+	}
+	deadline := s.deadlineTO(timeout)
+	var done bool
+	var backoffs uint
+	for ok := true; ok; ok = s.checkDeadline(deadline) == nil {
+		addrs, st, gen, done, err = s.async.dnsLookupPoll(host, qtype, st, gen)
+		if done {
+			return addrs, err
+		}
+		s.backoff(backoffs)
+		backoffs++
+	}
+	// Timeout: the generation owner aborts and releases all waiters; a
+	// departing follower leaves the shared query intact.
+	s.async.dnsLookupTimedOut(host, qtype, st, gen)
+	return nil, errDeadlineExceed
+}
+
+// doLookupIPTypeUncached is the legacy lookup behavior used when snapshot
+// caching is not enabled.
+func (s StackBlocking) doLookupIPTypeUncached(host string, timeout time.Duration, qtype dns.Type) (addrs []netip.Addr, err error) {
 	err = s.async.StartLookupIPType(host, qtype)
 	if err != nil {
 		return nil, err

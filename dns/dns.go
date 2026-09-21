@@ -606,8 +606,37 @@ func (r *Resource) Decode(b []byte, off uint16) (uint16, error) {
 			return end, nil
 		}
 	}
+	if r.header.Type == TypeSOA {
+		// SOA RDATA starts with two names (MNAME, RNAME) which may use message
+		// compression. Expand them so the detached r.data (and its MINIMUM
+		// field, used for RFC 2308 negative TTLs) stays resolvable later.
+		soa, noff, derr := appendExpandedName(r.data[:0], b, off)
+		if derr == nil {
+			soa, noff, derr = appendExpandedName(soa, b, noff)
+		}
+		if derr == nil && int(noff)+20 <= len(b) && noff+20 == end {
+			r.data = append(soa, b[noff:end]...)
+			r.header.Length = uint16(len(r.data))
+			return end, nil
+		}
+	}
 	r.data = append(r.data[:0], b[off:end]...)
 	return end, nil
+}
+
+// appendExpandedName appends the DNS name at msg[off] to dst in uncompressed
+// wire form, resolving any compression pointers against msg. It returns the
+// offset directly following the name in msg.
+func appendExpandedName(dst []byte, msg []byte, off uint16) (_ []byte, _ uint16, err error) {
+	newOff, err := visitAllLabels(msg, off, func(label []byte) {
+		dst = append(dst, byte(len(label)))
+		dst = append(dst, label...)
+	}, allowCompression)
+	if err != nil {
+		return dst, off, err
+	}
+	dst = append(dst, 0)
+	return dst, newOff, nil
 }
 
 func (r *Resource) appendTo(buf []byte) (_ []byte, err error) {

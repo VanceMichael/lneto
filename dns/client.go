@@ -5,6 +5,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"time"
 
 	"github.com/soypat/lneto"
 	"github.com/soypat/lneto/internal"
@@ -29,6 +30,11 @@ type ResolveConfig struct {
 	// are decoded in wire order regardless of type, so a response resolved
 	// through CNAMEs needs room for the CNAME records as well as the addresses.
 	MaxResponseAnswers uint16
+	// MaxAuthorityRecords limits how many authority-section records are
+	// decoded. Zero skips the section. Set it to at least 1 to receive the
+	// SOA record carried by negative responses, whose MINIMUM field gives the
+	// RFC 2308 negative-caching TTL.
+	MaxAuthorityRecords uint16
 }
 
 func (sudp *Client) Protocol() uint64 { return uint64(lneto.IPProtoUDP) }
@@ -47,7 +53,7 @@ func (c *Client) StartResolve(localPort, txid uint16, cfg ResolveConfig) error {
 		maxAns = uint16(nd)
 	}
 	c.reset(localPort, txid, CQueryPending, cfg.EnableRecursion)
-	c.msg.LimitResourceDecoding(uint16(nd), maxAns, 0, 0)
+	c.msg.LimitResourceDecoding(uint16(nd), maxAns, cfg.MaxAuthorityRecords, 0)
 	c.msg.AddQuestions(cfg.Questions)
 	c.msg.AddAdditionals(cfg.Additional)
 	return nil
@@ -114,6 +120,9 @@ func (c *Client) isClosed() bool {
 	return c.state == CQueryIdle || c.state == CQueryAborted
 }
 
+// IsClosed reports whether the client has no query in flight (idle or aborted).
+func (c *Client) IsClosed() bool { return c.isClosed() }
+
 func (c *Client) ResponseCopyTo(dst *Message) (done bool, err error) {
 	if !c.respFlags.IsResponse() {
 		return false, nil
@@ -139,6 +148,25 @@ func (c *Client) ResponseAnswerLookup(dst []netip.Addr, host string) (uint16, er
 
 func (c *Client) ResponseFlags() (HeaderFlags, bool) {
 	return c.respFlags, c.respFlags.IsResponse()
+}
+
+// ResponseMinAnswerTTL returns the minimum TTL of the response's A/AAAA and
+// CNAME answer records, used as the lifetime of a positive snapshot.
+func (c *Client) ResponseMinAnswerTTL() (time.Duration, bool) {
+	if !c.respFlags.IsResponse() {
+		return 0, false
+	}
+	return c.msg.MinAnswerTTL()
+}
+
+// ResponseNegativeTTL derives the RFC 2308 negative-caching TTL of the
+// response from its SOA authority record, using fallback when the response
+// carries no usable SOA and clamping the result to maxTTL.
+func (c *Client) ResponseNegativeTTL(fallback, maxTTL time.Duration) time.Duration {
+	if !c.respFlags.IsResponse() {
+		return 0
+	}
+	return NegativeTTL(c.msg.Authorities, fallback, maxTTL)
 }
 
 func (c *Client) Abort() {
